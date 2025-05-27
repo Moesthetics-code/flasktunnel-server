@@ -32,17 +32,38 @@ try:
 except ImportError:
     pass
 
-# Configuration améliorée
+if os.getenv('RAILWAY_ENVIRONMENT_NAME'):
+    # Configuration spéciale pour Railway
+    os.environ.setdefault('SQLALCHEMY_SILENCE_UBER_WARNING', '1')
+    
+    # Fix pour les variables Railway
+    if not os.getenv('DATABASE_URL') and os.getenv('RAILWAY_POSTGRES_URL'):
+        os.environ['DATABASE_URL'] = os.getenv('RAILWAY_POSTGRES_URL')
+
+# 1. Corriger la classe Config (remplacer toute la classe)
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_hex(32))
     
-    # Database URL avec support PostgreSQL
+    # Database URL avec support PostgreSQL - FIX Railway
     database_url = os.getenv('DATABASE_URL')
-    if database_url and database_url.startswith('postgres://'):
-        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    if database_url:
+        # Railway utilise parfois des URLs internes différentes
+        if database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        # Fix pour Railway - utiliser l'URL interne de la DB
+        if 'localhost' in database_url or 'locahost' in database_url:
+            # Remplacer par l'URL Railway
+            railway_db = os.getenv('RAILWAY_POSTGRES_URL')
+            if railway_db:
+                database_url = railway_db
     
     SQLALCHEMY_DATABASE_URI = database_url or 'sqlite:///flaskserver.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_timeout': 20,
+        'pool_recycle': -1,
+        'pool_pre_ping': True
+    }
     
     # Railway specific
     PORT = int(os.getenv('PORT', 8080))
@@ -1322,33 +1343,54 @@ atexit.register(cleanup)
 # Initialization
 # =============================================================================
 
-# 2. Modifier la fonction d'initialisation de la base de données (avant if __name__ == '__main__':)
+# 2. Modifier la fonction init_db (remplacer complètement)
 def init_db():
-    """Initialiser la base de données."""
+    """Initialiser la base de données avec gestion Railway."""
     try:
         with app.app_context():
-            # Attendre que la DB soit prête
-            import time
-            max_retries = 30
-            for i in range(max_retries):
-                try:
+            # Pour Railway, essayer d'utiliser les variables d'environnement spécifiques
+            db_url = os.getenv('DATABASE_URL') or os.getenv('RAILWAY_POSTGRES_URL')
+            
+            if not db_url:
+                print("❌ No database URL found!")
+                return False
+            
+            print(f"🔗 Connecting to database...")
+            
+            # Test de connexion simple d'abord
+            try:
+                # Créer les tables
+                db.create_all()
+                print("✅ Database initialized successfully!")
+                tunnel_service.mark_db_initialized()
+                return True
+                
+            except Exception as db_error:
+                print(f"❌ Database error: {str(db_error)}")
+                # Si l'erreur contient des infos de connexion, essayer des alternatives
+                if 'could not connect' in str(db_error).lower():
+                    print("🔄 Trying alternative connection...")
+                    # Attendre un peu et réessayer
+                    import time
+                    time.sleep(5)
                     db.create_all()
-                    print("Database initialized!")
+                    print("✅ Database initialized on retry!")
                     tunnel_service.mark_db_initialized()
-                    break
-                except Exception as e:
-                    if i == max_retries - 1:
-                        raise e
-                    print(f"DB not ready, retrying... ({i+1}/{max_retries})")
-                    time.sleep(2)
+                    return True
+                else:
+                    raise db_error
+                    
     except Exception as e:
-        print(f"Database initialization error: {e}")
+        print(f"❌ Database initialization failed: {e}")
+        return False
 
 
-# 3. Modifier la partie main (remplacer tout le bloc if __name__ == '__main__':)
+# 3. Modifier la section principale (remplacer le bloc if __name__ == '__main__':)
 if __name__ == '__main__':
     # Initialiser la DB au démarrage
-    init_db()
+    if not init_db():
+        print("❌ Failed to initialize database, exiting...")
+        exit(1)
     
     # Configuration pour le déploiement
     port = int(os.getenv('PORT', 8080))
@@ -1364,9 +1406,27 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=port,
         debug=debug,
-        use_reloader=False,  # Désactiver le reloader en production
+        use_reloader=False,
         log_output=True
     )
 else:
-    # Pour les serveurs WSGI comme gunicorn
-    init_db()
+    # Pour les serveurs WSGI comme gunicorn - IMPORTANT pour Railway
+    print("🔧 Running under WSGI server (gunicorn)")
+    
+    # Initialiser la DB de façon non-bloquante pour gunicorn
+    def init_db_background():
+        import threading
+        import time
+        def delayed_init():
+            time.sleep(2)  # Attendre que gunicorn soit prêt
+            with app.app_context():
+                success = init_db()
+                if success:
+                    print("✅ Background DB initialization completed")
+                else:
+                    print("❌ Background DB initialization failed")
+        
+        thread = threading.Thread(target=delayed_init, daemon=True)
+        thread.start()
+    
+    init_db_background()
