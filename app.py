@@ -45,52 +45,39 @@ if os.getenv('RAILWAY_ENVIRONMENT_NAME'):
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_hex(32))
     
-    # Database URL avec support PostgreSQL - FIX Railway
-    database_url = os.getenv('DATABASE_URL')
+    # Détecter l'environnement Railway
+    is_railway = bool(os.getenv('RAILWAY_ENVIRONMENT_NAME'))
+    is_production = os.getenv('FLASK_ENV') == 'production'
     
-    # Si pas de DATABASE_URL, essayer d'autres variables Railway
-    if not database_url:
-        # Variables Railway communes
-        railway_vars = [
-            'RAILWAY_POSTGRES_URL',
-            'POSTGRES_URL', 
-            'POSTGRESQL_URL'
-        ]
-        for var in railway_vars:
-            if os.getenv(var):
-                database_url = os.getenv(var)
-                break
-    
-    if database_url:
-        # Corriger les URLs postgres:// vers postgresql://
-        if database_url.startswith('postgres://'):
+    # Configuration base de données pour Railway
+    if is_railway:
+        # Sur Railway : utiliser DATABASE_URL fourni automatiquement
+        database_url = os.getenv('DATABASE_URL')
+        if database_url and database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
-        # Debug pour voir l'URL (masquer le mot de passe)
-        from urllib.parse import urlparse
-        parsed = urlparse(database_url)
-        safe_url = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
-        print(f"🔗 Database URL: {safe_url}")
-        
-        # Vérifier si l'URL contient des variables non résolues
-        if 'host' == parsed.hostname or not parsed.hostname:
-            print("❌ Invalid database hostname detected, falling back to SQLite")
-            database_url = None
+        SQLALCHEMY_DATABASE_URI = database_url
+        print(f"🚄 Railway environment detected")
+        print(f"📊 Database: PostgreSQL")
+    else:
+        # En local : utiliser SQLite ou variable custom
+        SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///flaskserver.db')
+        print("🏠 Local environment detected")
+        print(f"📊 Database: {SQLALCHEMY_DATABASE_URI.split('://')[0]}")
     
-    SQLALCHEMY_DATABASE_URI = database_url or 'sqlite:///flaskserver.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
         'pool_timeout': 20,
-        'pool_recycle': -1,
-        'pool_pre_ping': True
+        'pool_recycle': 3600,  # 1 heure
+        'pool_pre_ping': True,
+        'pool_size': 5,
+        'max_overflow': 10
     }
     
-    # Railway specific
     PORT = int(os.getenv('PORT', 8080))
     RAILWAY_ENVIRONMENT = os.getenv('RAILWAY_ENVIRONMENT_NAME', 'development')
 
-
-# Supprimer les warnings de Flask-Limiter
+# Supprimer les warnings
 warnings.filterwarnings("ignore", message="Using the in-memory storage for tracking rate limits")
 
 # =============================================================================
@@ -106,15 +93,16 @@ CORS(app, origins=["*"], allow_headers=["*"], methods=["*"])
 # Database
 db = SQLAlchemy(app)
 
-# SocketIO - Configuration pour production
+# SocketIO - Configuration optimisée pour Railway
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
     logger=False, 
     engineio_logger=False,
-    async_mode='eventlet',  # Changer pour eventlet
+    async_mode='eventlet',
     ping_timeout=60,
-    ping_interval=25
+    ping_interval=25,
+    transports=['websocket', 'polling']
 )
 
 # Rate Limiting
@@ -273,33 +261,28 @@ class TunnelService:
         self.active_tunnels: Dict[str, Dict] = {}
         self.cleanup_running = True
         self.db_initialized = False
-        # Démarrer le thread de nettoyage seulement après l'initialisation de la DB
     
     def start_cleanup_thread(self):
         """Démarrer le thread de nettoyage après l'initialisation de la DB."""
         if not hasattr(self, 'cleanup_thread') or not self.cleanup_thread.is_alive():
             self.cleanup_thread = threading.Thread(target=self._cleanup_expired_tunnels, daemon=True)
             self.cleanup_thread.start()
-            print("Cleanup thread started")
+            print("✅ Cleanup thread started")
     
     def _cleanup_expired_tunnels(self):
-        """Nettoyer les tunnels expirés avec contexte d'application."""
-        # Attendre que la DB soit initialisée
+        """Nettoyer les tunnels expirés."""
         while not self.db_initialized and self.cleanup_running:
             time.sleep(1)
         
         while self.cleanup_running:
             try:
                 with self.app.app_context():
-                    # Vérifier si les tables existent avant d'essayer de les requêter
                     try:
-                        from sqlalchemy import inspect
                         inspector = inspect(db.engine)
                         if 'tunnels' not in inspector.get_table_names():
                             time.sleep(5)
                             continue
-                    except Exception as table_check_error:
-                        print(f"Table check error: {table_check_error}")
+                    except Exception:
                         time.sleep(5)
                         continue
                     
@@ -313,23 +296,22 @@ class TunnelService:
                         if tunnel.tunnel_id in self.active_tunnels:
                             del self.active_tunnels[tunnel.tunnel_id]
                         
-                        # Notifier via WebSocket
                         try:
                             socketio.emit('tunnel_expired', {
                                 'tunnel_id': tunnel.tunnel_id,
                                 'message': 'Tunnel expired'
                             }, room=f"tunnel_{tunnel.tunnel_id}")
-                        except Exception as ws_error:
-                            print(f"WebSocket notification error: {ws_error}")
+                        except Exception:
+                            pass
                     
                     if expired_tunnels:
                         db.session.commit()
-                        print(f"Cleaned {len(expired_tunnels)} expired tunnels")
+                        print(f"🧹 Cleaned {len(expired_tunnels)} expired tunnels")
                 
             except Exception as e:
-                print(f"Error in cleanup: {e}")
+                print(f"❌ Error in cleanup: {e}")
             
-            time.sleep(60)  # Vérifier toutes les minutes
+            time.sleep(60)
     
     def stop_cleanup(self):
         """Arrêter le thread de nettoyage."""
@@ -346,7 +328,6 @@ class TunnelService:
         db.session.add(tunnel)
         db.session.commit()
         
-        # Ajouter aux tunnels actifs
         self.active_tunnels[tunnel.tunnel_id] = {
             'tunnel': tunnel,
             'proxy_thread': None,
@@ -370,8 +351,6 @@ class TunnelService:
             return True
         return False
 
-
-# Initialiser le service après la création de l'app
 tunnel_service = TunnelService(app)
 
 # =============================================================================
@@ -383,12 +362,10 @@ def get_user_from_token(token: str) -> Optional[User]:
     if not token:
         return None
     
-    # Enlever "Bearer " si présent
     if token.startswith('Bearer '):
         token = token[7:]
     
     return User.query.filter_by(api_key=token, is_active=True).first()
-
 
 def generate_subdomain() -> str:
     """Générer un sous-domaine aléatoire unique."""
@@ -400,7 +377,6 @@ def generate_subdomain() -> str:
         if not Tunnel.query.filter_by(subdomain=subdomain).first():
             return subdomain
 
-
 def validate_subdomain(subdomain: str) -> bool:
     """Valider un sous-domaine."""
     if not subdomain or len(subdomain) > 50:
@@ -410,9 +386,7 @@ def validate_subdomain(subdomain: str) -> bool:
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$', subdomain):
         return False
     
-    # Vérifier si déjà utilisé
     return not Tunnel.query.filter_by(subdomain=subdomain.lower()).first()
-
 
 def parse_duration(duration: str) -> timedelta:
     """Parser une durée en timedelta."""
@@ -438,7 +412,9 @@ def health():
         'status': 'healthy',
         'version': '1.0.0',
         'timestamp': datetime.utcnow().isoformat(),
-        'active_tunnels': len(tunnel_service.active_tunnels)
+        'active_tunnels': len(tunnel_service.active_tunnels),
+        'environment': app.config['RAILWAY_ENVIRONMENT'],
+        'database': 'PostgreSQL' if 'postgresql' in app.config['SQLALCHEMY_DATABASE_URI'] else 'SQLite'
     })
 
 
@@ -1360,39 +1336,29 @@ atexit.register(cleanup)
 
 
 # =============================================================================
-# Initialization
+# Initialization corrigée pour Railway
 # =============================================================================
 
 def init_db():
-    """Initialiser la base de données avec gestion Railway."""
+    """Initialiser la base de données optimisée pour Railway."""
     try:
         with app.app_context():
-            # Debug des variables d'environnement Railway
-            print("🔍 Checking environment variables:")
-            db_vars = ['DATABASE_URL', 'RAILWAY_POSTGRES_URL', 'POSTGRES_URL', 'POSTGRESQL_URL']
-            for var in db_vars:
-                value = os.getenv(var)
-                if value:
-                    # Masquer le mot de passe pour l'affichage
-                    from urllib.parse import urlparse
-                    try:
-                        parsed = urlparse(value)
-                        safe_value = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
-                        print(f"   {var}: {safe_value}")
-                    except:
-                        print(f"   {var}: [PRESENT BUT UNPARSEABLE]")
-                else:
-                    print(f"   {var}: [NOT SET]")
+            print("🔄 Initializing database...")
             
-            print(f"🔗 Final database URI: {app.config['SQLALCHEMY_DATABASE_URI'][:50]}...")
+            # Afficher la configuration
+            db_uri = app.config['SQLALCHEMY_DATABASE_URI']
+            if 'postgresql' in db_uri:
+                print("🐘 Using PostgreSQL (Railway)")
+            else:
+                print("🗄️  Using SQLite (Local)")
             
-            # Test de connexion avec retry
-            max_retries = 3
+            max_retries = 5
             for attempt in range(max_retries):
                 try:
-                    # Tester la connexion
+                    # Test de connexion
                     with db.engine.connect() as conn:
-                        conn.execute(db.text("SELECT 1"))
+                        result = conn.execute(db.text("SELECT 1"))
+                        result.fetchone()
                     
                     # Créer les tables
                     db.create_all()
@@ -1404,43 +1370,38 @@ def init_db():
                     print(f"❌ Database attempt {attempt + 1}/{max_retries} failed: {str(db_error)}")
                     
                     if attempt < max_retries - 1:
-                        import time
-                        wait_time = (attempt + 1) * 2  # 2, 4, 6 secondes
-                        print(f"⏳ Waiting {wait_time}s before retry...")
+                        wait_time = min(2 ** attempt, 10)  # Backoff exponentiel
+                        print(f"⏳ Retrying in {wait_time}s...")
                         time.sleep(wait_time)
                     else:
-                        # Dernier essai échoué
-                        if 'sqlite' not in app.config['SQLALCHEMY_DATABASE_URI']:
-                            print("🔄 Falling back to SQLite for development...")
+                        # Fallback pour développement local uniquement
+                        if not app.config.get('is_railway', False):
+                            print("🔄 Falling back to SQLite...")
                             app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///flaskserver.db'
                             db.create_all()
-                            print("✅ SQLite database initialized as fallback!")
+                            print("✅ SQLite fallback initialized!")
                             tunnel_service.mark_db_initialized()
                             return True
                         else:
                             raise db_error
                     
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
+        print(f"❌ Critical database error: {e}")
         return False
 
 
-# 3. Modifier la section principale (remplacer le bloc if __name__ == '__main__':)
 if __name__ == '__main__':
-    # Initialiser la DB au démarrage
+    # Mode développement local
     if not init_db():
-        print("❌ Failed to initialize database, exiting...")
+        print("❌ Database initialization failed!")
         exit(1)
     
-    # Configuration pour le déploiement
     port = int(os.getenv('PORT', 8080))
-    debug = os.getenv('FLASK_ENV') == 'development'
+    debug = os.getenv('FLASK_ENV') != 'production'
     
-    print(f"🚀 FlaskTunnel Server starting on port {port}")
-    print(f"📊 Debug mode: {debug}")
-    print(f"🔄 Environment: {os.getenv('RAILWAY_ENVIRONMENT_NAME', 'local')}")
+    print(f"🚀 FlaskTunnel starting on port {port}")
+    print(f"🔧 Debug mode: {debug}")
     
-    # Utiliser socketio.run au lieu de app.run pour la compatibilité
     socketio.run(
         app,
         host='0.0.0.0',
@@ -1450,41 +1411,31 @@ if __name__ == '__main__':
         log_output=True
     )
 else:
-    # Pour les serveurs WSGI comme gunicorn - IMPORTANT pour Railway
-    print("🔧 Running under WSGI server (gunicorn)")
+    # Mode production (Railway avec gunicorn)
+    print("🚄 Running on Railway with gunicorn")
     
-    # Afficher les variables d'environnement Railway pour debug
-    print("🔍 Railway Environment:")
-    railway_vars = ['RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_POSTGRES_URL', 'DATABASE_URL', 'PORT']
-    for var in railway_vars:
-        value = os.getenv(var)
-        if var in ['RAILWAY_POSTGRES_URL', 'DATABASE_URL'] and value:
-            # Masquer le mot de passe
-            try:
-                parsed = urlparse(value)
-                safe_value = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
-                print(f"   {var}: {safe_value}")
-            except:
-                print(f"   {var}: [PRESENT]")
-        else:
-            print(f"   {var}: {value}")
-    
-    # Initialiser la DB de façon non-bloquante pour gunicorn
-    def init_db_background():
+    def init_db_async():
+        """Initialisation asynchrone pour éviter de bloquer gunicorn."""
         import threading
-        import time
         def delayed_init():
-            time.sleep(1)  # Attendre que gunicorn soit prêt
+            time.sleep(2)  # Laisser gunicorn démarrer
             try:
                 success = init_db()
                 if success:
-                    print("✅ Background DB initialization completed")
+                    print("✅ Railway database initialized")
                 else:
-                    print("❌ Background DB initialization failed")
+                    print("❌ Railway database initialization failed")
             except Exception as e:
-                print(f"❌ Background DB initialization error: {e}")
+                print(f"❌ Railway DB error: {e}")
         
         thread = threading.Thread(target=delayed_init, daemon=True)
         thread.start()
     
-    init_db_background()
+    init_db_async()
+
+# Cleanup handler
+import atexit
+def cleanup():
+    if tunnel_service:
+        tunnel_service.stop_cleanup()
+atexit.register(cleanup)
