@@ -64,7 +64,9 @@ socketio = SocketIO(
     cors_allowed_origins="*", 
     logger=False, 
     engineio_logger=False,
-    async_mode='threading'  # Utiliser threading au lieu d'eventlet
+    async_mode='threading',  # Garder threading
+    ping_timeout=60,
+    ping_interval=25
 )
 
 # Rate Limiting
@@ -1289,14 +1291,32 @@ atexit.register(cleanup)
 # Initialization
 # =============================================================================
 
+# 2. Modifier la fonction d'initialisation de la base de données (avant if __name__ == '__main__':)
 def init_db():
     """Initialiser la base de données."""
-    with app.app_context():
-        db.create_all()
-        print("Database initialized!")
+    try:
+        with app.app_context():
+            # Attendre que la DB soit prête
+            import time
+            max_retries = 30
+            for i in range(max_retries):
+                try:
+                    db.create_all()
+                    print("Database initialized!")
+                    tunnel_service.mark_db_initialized()
+                    break
+                except Exception as e:
+                    if i == max_retries - 1:
+                        raise e
+                    print(f"DB not ready, retrying... ({i+1}/{max_retries})")
+                    time.sleep(2)
+    except Exception as e:
+        print(f"Database initialization error: {e}")
 
 
+# 3. Modifier la partie main (remplacer tout le bloc if __name__ == '__main__':)
 if __name__ == '__main__':
+    # Initialiser la DB au démarrage
     init_db()
     
     # Configuration pour le déploiement
@@ -1305,11 +1325,17 @@ if __name__ == '__main__':
     
     print(f"🚀 FlaskTunnel Server starting on port {port}")
     print(f"📊 Debug mode: {debug}")
+    print(f"🔄 Environment: {os.getenv('RAILWAY_ENVIRONMENT_NAME', 'local')}")
     
+    # Utiliser socketio.run au lieu de app.run pour la compatibilité
     socketio.run(
         app,
         host='0.0.0.0',
         port=port,
         debug=debug,
-        allow_unsafe_werkzeug=True
+        use_reloader=False,  # Désactiver le reloader en production
+        log_output=True
     )
+else:
+    # Pour les serveurs WSGI comme gunicorn
+    init_db()
