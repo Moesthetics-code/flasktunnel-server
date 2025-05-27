@@ -1,5 +1,5 @@
 # =============================================================================
-# app.py - FlaskTunnel Server (Version Corrigée)
+# app.py - FlaskTunnel Server (Version Railway Compatible)
 # =============================================================================
 
 import os
@@ -58,8 +58,14 @@ CORS(app, origins=["*"], allow_headers=["*"], methods=["*"])
 # Database
 db = SQLAlchemy(app)
 
-# SocketIO
-socketio = SocketIO(app, cors_allowed_origins="*", logger=False, engineio_logger=False)
+# SocketIO - Configuration pour production
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    logger=False, 
+    engineio_logger=False,
+    async_mode='threading'  # Utiliser threading au lieu d'eventlet
+)
 
 # Rate Limiting
 limiter = Limiter(
