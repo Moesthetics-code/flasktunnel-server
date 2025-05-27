@@ -22,6 +22,8 @@ from flask_limiter.util import get_remote_address
 
 from sqlalchemy import inspect
 
+from urllib.parse import urlparse
+
 # Au début du fichier, après les imports
 import os
 from urllib.parse import urlparse
@@ -45,16 +47,35 @@ class Config:
     
     # Database URL avec support PostgreSQL - FIX Railway
     database_url = os.getenv('DATABASE_URL')
+    
+    # Si pas de DATABASE_URL, essayer d'autres variables Railway
+    if not database_url:
+        # Variables Railway communes
+        railway_vars = [
+            'RAILWAY_POSTGRES_URL',
+            'POSTGRES_URL', 
+            'POSTGRESQL_URL'
+        ]
+        for var in railway_vars:
+            if os.getenv(var):
+                database_url = os.getenv(var)
+                break
+    
     if database_url:
-        # Railway utilise parfois des URLs internes différentes
+        # Corriger les URLs postgres:// vers postgresql://
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
-        # Fix pour Railway - utiliser l'URL interne de la DB
-        if 'localhost' in database_url or 'locahost' in database_url:
-            # Remplacer par l'URL Railway
-            railway_db = os.getenv('RAILWAY_POSTGRES_URL')
-            if railway_db:
-                database_url = railway_db
+        
+        # Debug pour voir l'URL (masquer le mot de passe)
+        from urllib.parse import urlparse
+        parsed = urlparse(database_url)
+        safe_url = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
+        print(f"🔗 Database URL: {safe_url}")
+        
+        # Vérifier si l'URL contient des variables non résolues
+        if 'host' == parsed.hostname or not parsed.hostname:
+            print("❌ Invalid database hostname detected, falling back to SQLite")
+            database_url = None
     
     SQLALCHEMY_DATABASE_URI = database_url or 'sqlite:///flaskserver.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
@@ -1342,42 +1363,62 @@ atexit.register(cleanup)
 # Initialization
 # =============================================================================
 
-# 2. Modifier la fonction init_db (remplacer complètement)
 def init_db():
     """Initialiser la base de données avec gestion Railway."""
     try:
         with app.app_context():
-            # Pour Railway, essayer d'utiliser les variables d'environnement spécifiques
-            db_url = os.getenv('DATABASE_URL') or os.getenv('RAILWAY_POSTGRES_URL')
+            # Debug des variables d'environnement Railway
+            print("🔍 Checking environment variables:")
+            db_vars = ['DATABASE_URL', 'RAILWAY_POSTGRES_URL', 'POSTGRES_URL', 'POSTGRESQL_URL']
+            for var in db_vars:
+                value = os.getenv(var)
+                if value:
+                    # Masquer le mot de passe pour l'affichage
+                    from urllib.parse import urlparse
+                    try:
+                        parsed = urlparse(value)
+                        safe_value = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
+                        print(f"   {var}: {safe_value}")
+                    except:
+                        print(f"   {var}: [PRESENT BUT UNPARSEABLE]")
+                else:
+                    print(f"   {var}: [NOT SET]")
             
-            if not db_url:
-                print("❌ No database URL found!")
-                return False
+            print(f"🔗 Final database URI: {app.config['SQLALCHEMY_DATABASE_URI'][:50]}...")
             
-            print(f"🔗 Connecting to database...")
-            
-            # Test de connexion simple d'abord
-            try:
-                # Créer les tables
-                db.create_all()
-                print("✅ Database initialized successfully!")
-                tunnel_service.mark_db_initialized()
-                return True
-                
-            except Exception as db_error:
-                print(f"❌ Database error: {str(db_error)}")
-                # Si l'erreur contient des infos de connexion, essayer des alternatives
-                if 'could not connect' in str(db_error).lower():
-                    print("🔄 Trying alternative connection...")
-                    # Attendre un peu et réessayer
-                    import time
-                    time.sleep(5)
+            # Test de connexion avec retry
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # Tester la connexion
+                    with db.engine.connect() as conn:
+                        conn.execute(db.text("SELECT 1"))
+                    
+                    # Créer les tables
                     db.create_all()
-                    print("✅ Database initialized on retry!")
+                    print("✅ Database initialized successfully!")
                     tunnel_service.mark_db_initialized()
                     return True
-                else:
-                    raise db_error
+                    
+                except Exception as db_error:
+                    print(f"❌ Database attempt {attempt + 1}/{max_retries} failed: {str(db_error)}")
+                    
+                    if attempt < max_retries - 1:
+                        import time
+                        wait_time = (attempt + 1) * 2  # 2, 4, 6 secondes
+                        print(f"⏳ Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    else:
+                        # Dernier essai échoué
+                        if 'sqlite' not in app.config['SQLALCHEMY_DATABASE_URI']:
+                            print("🔄 Falling back to SQLite for development...")
+                            app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///flaskserver.db'
+                            db.create_all()
+                            print("✅ SQLite database initialized as fallback!")
+                            tunnel_service.mark_db_initialized()
+                            return True
+                        else:
+                            raise db_error
                     
     except Exception as e:
         print(f"❌ Database initialization failed: {e}")
@@ -1412,18 +1453,36 @@ else:
     # Pour les serveurs WSGI comme gunicorn - IMPORTANT pour Railway
     print("🔧 Running under WSGI server (gunicorn)")
     
+    # Afficher les variables d'environnement Railway pour debug
+    print("🔍 Railway Environment:")
+    railway_vars = ['RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_POSTGRES_URL', 'DATABASE_URL', 'PORT']
+    for var in railway_vars:
+        value = os.getenv(var)
+        if var in ['RAILWAY_POSTGRES_URL', 'DATABASE_URL'] and value:
+            # Masquer le mot de passe
+            try:
+                parsed = urlparse(value)
+                safe_value = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
+                print(f"   {var}: {safe_value}")
+            except:
+                print(f"   {var}: [PRESENT]")
+        else:
+            print(f"   {var}: {value}")
+    
     # Initialiser la DB de façon non-bloquante pour gunicorn
     def init_db_background():
         import threading
         import time
         def delayed_init():
-            time.sleep(2)  # Attendre que gunicorn soit prêt
-            with app.app_context():
+            time.sleep(1)  # Attendre que gunicorn soit prêt
+            try:
                 success = init_db()
                 if success:
                     print("✅ Background DB initialization completed")
                 else:
                     print("❌ Background DB initialization failed")
+            except Exception as e:
+                print(f"❌ Background DB initialization error: {e}")
         
         thread = threading.Thread(target=delayed_init, daemon=True)
         thread.start()
