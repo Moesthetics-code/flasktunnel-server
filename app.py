@@ -40,7 +40,6 @@ if os.getenv('RAILWAY_ENVIRONMENT_NAME'):
     if not os.getenv('DATABASE_URL') and os.getenv('RAILWAY_POSTGRES_URL'):
         os.environ['DATABASE_URL'] = os.getenv('RAILWAY_POSTGRES_URL')
 
-# 1. Corriger la classe Config (remplacer toute la classe)
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_hex(32))
     
