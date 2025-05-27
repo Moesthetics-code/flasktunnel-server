@@ -1,6 +1,5 @@
-# =============================================================================
-# app.py - FlaskTunnel Server (Version Railway Compatible)
-# =============================================================================
+import eventlet
+eventlet.monkey_patch()
 
 import os
 import time
@@ -21,9 +20,17 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from sqlalchemy import inspect
+
 # Au début du fichier, après les imports
 import os
 from urllib.parse import urlparse
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Configuration améliorée
 class Config:
@@ -64,7 +71,7 @@ socketio = SocketIO(
     cors_allowed_origins="*", 
     logger=False, 
     engineio_logger=False,
-    async_mode='threading',  # Garder threading
+    async_mode='eventlet',  # Changer pour eventlet
     ping_timeout=60,
     ping_interval=25
 )
@@ -160,7 +167,12 @@ class Tunnel(db.Model):
         if not self.tunnel_id:
             self.tunnel_id = self.generate_tunnel_id()
         if not self.public_url:
-            self.public_url = f"https://{self.subdomain}.flasktunnel.dev"
+            # Utiliser le domaine Railway au lieu de flasktunnel.dev
+            base_domain = os.getenv('RAILWAY_STATIC_URL', '').replace('https://', '').replace('http://', '')
+            if base_domain:
+                self.public_url = f"https://{base_domain}/{self.subdomain}"
+            else:
+                self.public_url = f"http://localhost:8080/{self.subdomain}"
     
     def generate_tunnel_id(self) -> str:
         """Générer un ID de tunnel unique."""
@@ -239,7 +251,14 @@ class TunnelService:
             try:
                 with self.app.app_context():
                     # Vérifier si les tables existent avant d'essayer de les requêter
-                    if not db.engine.has_table('tunnels'):
+                    try:
+                        from sqlalchemy import inspect
+                        inspector = inspect(db.engine)
+                        if 'tunnels' not in inspector.get_table_names():
+                            time.sleep(5)
+                            continue
+                    except Exception as table_check_error:
+                        print(f"Table check error: {table_check_error}")
                         time.sleep(5)
                         continue
                     
@@ -467,6 +486,7 @@ def validate_token():
     })
 
 
+# 3. Modifier la fonction create_tunnel dans l'API
 @app.route('/api/tunnels', methods=['POST'])
 @limiter.limit("10 per minute")
 def create_tunnel():
@@ -509,13 +529,20 @@ def create_tunnel():
         if duration > timedelta(hours=2):
             duration = timedelta(hours=2)
     
+    # Construire l'URL publique
+    base_domain = os.getenv('RAILWAY_STATIC_URL', '').replace('https://', '').replace('http://', '')
+    if base_domain:
+        public_url = f"https://{base_domain}/{subdomain}"
+    else:
+        public_url = f"http://localhost:8080/{subdomain}"
+    
     try:
         tunnel = tunnel_service.create_tunnel(
             tunnel_id=secrets.token_urlsafe(8),
             user_id=user.id if user else None,
             subdomain=subdomain,
             port=port,
-            public_url=f"https://{subdomain}.flasktunnel.dev",
+            public_url=public_url,
             expires_at=datetime.utcnow() + duration,
             cors_enabled=data.get('cors', False),
             https_enabled=data.get('https', False),
@@ -1045,14 +1072,14 @@ def index():
                         </div>
                         <div class="code-content">
                             <span class="comment"># Créer un tunnel</span><br>
-                            <span class="keyword">curl</span> -X <span class="string">POST</span> https://api.flasktunnel.dev/api/tunnels \<br>
+                            <span class="keyword">curl</span> -X <span class="string">POST</span> {{ base_url }}/api/tunnels \<br>
                             &nbsp;&nbsp;-H <span class="string">"Content-Type: application/json"</span> \<br>
                             &nbsp;&nbsp;-d <span class="string">'{"port": 3000, "subdomain": "myapp"}'</span><br><br>
                             
                             <span class="comment"># Réponse</span><br>
                             {<br>
                             &nbsp;&nbsp;<span class="string">"tunnel_id"</span>: <span class="string">"abc123def"</span>,<br>
-                            &nbsp;&nbsp;<span class="string">"public_url"</span>: <span class="highlight">"https://myapp.flasktunnel.dev"</span>,<br>
+                            &nbsp;&nbsp;<span class="string">"public_url"</span>: <span class="highlight">"{{ base_url }}/myapp"</span>,<br>
                             &nbsp;&nbsp;<span class="string">"status"</span>: <span class="string">"active"</span><br>
                             }
                         </div>
@@ -1124,12 +1151,14 @@ def index():
     
     stats = {
         'active_tunnels': len(tunnel_service.active_tunnels),
-        'total_users': User.query.count()
+        'total_users': User.query.count(),
+        'base_url': base_domain if (base_domain := os.getenv('RAILWAY_STATIC_URL', '')) else 'http://localhost:8080'
     }
     
     return render_template_string(html, **stats)
 
 
+# 4. Modifier la route proxy pour gérer les sous-domaines comme des paths
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
@@ -1144,7 +1173,8 @@ def proxy_tunnel(subdomain: str, path: str = ''):
     if not tunnel:
         return jsonify({
             'error': 'Tunnel not found or expired',
-            'subdomain': subdomain
+            'subdomain': subdomain,
+            'available_tunnels': [t.subdomain for t in Tunnel.query.filter_by(status='active').all()]
         }), 404
     
     # Vérifier le mot de passe si nécessaire
@@ -1154,7 +1184,7 @@ def proxy_tunnel(subdomain: str, path: str = ''):
             return jsonify({'error': 'Password required'}), 401
     
     # Construire l'URL de destination
-    target_url = f"http://localhost:{tunnel.port}/{path}"
+    target_url = f"http://127.0.0.1:{tunnel.port}/{path}"
     if request.query_string:
         target_url += f"?{request.query_string.decode()}"
     
@@ -1163,7 +1193,7 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         response = requests.request(
             method=request.method,
             url=target_url,
-            headers={k: v for k, v in request.headers if k.lower() != 'host'},
+            headers={k: v for k, v in request.headers if k.lower() not in ['host', 'x-forwarded-for', 'x-forwarded-proto']},
             data=request.get_data(),
             params=request.args,
             allow_redirects=False,
@@ -1208,7 +1238,8 @@ def proxy_tunnel(subdomain: str, path: str = ''):
     except requests.ConnectionError:
         return jsonify({
             'error': 'Connection refused',
-            'message': f'No service running on localhost:{tunnel.port}'
+            'message': f'No service running on localhost:{tunnel.port}',
+            'tunnel': tunnel.to_dict()
         }), 502
     except requests.Timeout:
         return jsonify({'error': 'Request timeout'}), 504
