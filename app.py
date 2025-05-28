@@ -49,6 +49,7 @@ class Config:
     is_railway = bool(os.getenv('RAILWAY_ENVIRONMENT_NAME'))
     is_production = os.getenv('FLASK_ENV') == 'production'
     
+    
     # Configuration base de données pour Railway
     if is_railway:
         # Sur Railway : utiliser DATABASE_URL fourni automatiquement
@@ -396,13 +397,22 @@ def parse_duration(duration: str) -> timedelta:
 @app.route('/api/health', methods=['GET'])
 def health():
     """Point de santé du service."""
+    
+    # Determine database type from connection string
+    db_uri = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    if 'postgresql' in db_uri.lower():
+        database_type = 'PostgreSQL'
+    elif 'sqlite' in db_uri.lower():
+        database_type = 'SQLite'
+    else:
+        database_type = 'Unknown'
+    
     return jsonify({
         'status': 'healthy',
         'version': '1.0.0',
         'timestamp': datetime.utcnow().isoformat(),
         'active_tunnels': len(tunnel_service.active_tunnels),
-        'environment': app.config['RAILWAY_ENVIRONMENT'],
-        'database': 'PostgreSQL' if 'postgresql' in app.config['SQLALCHEMY_DATABASE_URI'] else 'SQLite'
+        'database': database_type
     })
 
 
