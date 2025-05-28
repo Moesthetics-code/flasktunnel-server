@@ -1,3 +1,4 @@
+import base64
 from sqlite3 import IntegrityError
 import eventlet
 eventlet.monkey_patch()
