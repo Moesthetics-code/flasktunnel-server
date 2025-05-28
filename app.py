@@ -1,3 +1,4 @@
+from sqlite3 import IntegrityError
 import eventlet
 eventlet.monkey_patch()
 
@@ -375,6 +376,11 @@ def validate_subdomain(subdomain: str) -> bool:
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$', subdomain):
         return False
     
+    # Mots réservés
+    reserved = ['api', 'www', 'admin', 'mail', 'ftp', 'localhost', 'dashboard']
+    if subdomain.lower() in reserved:
+        return False
+    
     return not Tunnel.query.filter_by(subdomain=subdomain.lower()).first()
 
 def parse_duration(duration: str) -> timedelta:
@@ -389,6 +395,34 @@ def parse_duration(duration: str) -> timedelta:
     }
     return duration_map.get(duration, timedelta(hours=2))
 
+
+# 5. AJOUTS POUR LA GESTION D'ERREURS GLOBALE
+# =============================================================================
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Gestionnaire global d'erreurs."""
+    app.logger.error(f"Erreur non gérée: {str(e)}", exc_info=True)
+    
+    if isinstance(e, IntegrityError):
+        return jsonify({'error': 'Violation de contrainte de base de données'}), 409
+    else:
+        return jsonify({'error': 'Erreur interne du serveur'}), 500
+
+# 6. LOGGING AMÉLIORÉ
+# =============================================================================
+
+import logging
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Logger spécifique pour FlaskTunnel
+flasktunnel_logger = logging.getLogger('flasktunnel')
+flasktunnel_logger.setLevel(logging.DEBUG)
 
 # =============================================================================
 # API Routes
@@ -501,64 +535,88 @@ def validate_token():
     })
 
 
-# 3. Modifier la fonction create_tunnel dans l'API
 @app.route('/api/tunnels', methods=['POST'])
 @limiter.limit("10 per minute")
 def create_tunnel():
     """Créer un nouveau tunnel."""
-    data = request.get_json()
-    
-    if not data:
-        return jsonify({'error': 'Données requises'}), 400
-    
-    # Récupérer l'utilisateur (optionnel pour mode gratuit)
-    token = request.headers.get('Authorization')
-    user = get_user_from_token(token)
-    
-    # Validation des données
-    port = data.get('port')
-    if not port or not isinstance(port, int) or port < 1 or port > 65535:
-        return jsonify({'error': 'Port invalide'}), 400
-    
-    # Ports bloqués
-    blocked_ports = [22, 25, 53, 80, 443, 993, 995]
-    if port in blocked_ports:
-        return jsonify({'error': f'Port {port} bloqué pour des raisons de sécurité'}), 400
-    
-    # Sous-domaine
-    subdomain = data.get('subdomain')
-    if subdomain:
-        if not validate_subdomain(subdomain):
-            return jsonify({'error': 'Sous-domaine invalide ou déjà utilisé'}), 409
-        subdomain = subdomain.lower()
-    else:
-        subdomain = generate_subdomain()
-    
-    # Durée
-    duration_str = data.get('duration', '2h')
-    duration = parse_duration(duration_str)
-    
-    # Limites pour utilisateurs non authentifiés
-    if not user:
-        # Limiter à 2h maximum pour les utilisateurs non authentifiés
-        if duration > timedelta(hours=2):
-            duration = timedelta(hours=2)
-    
-    # Construire l'URL publique
-    base_domain = os.getenv('RAILWAY_STATIC_URL', '').replace('https://', '').replace('http://', '')
-    if base_domain:
-        public_url = f"https://{base_domain}/{subdomain}"
-    else:
-        public_url = f"http://localhost:8080/{subdomain}"
-    
     try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Données JSON requises'}), 400
+        
+        # Log des données reçues pour debug
+        app.logger.info(f"Données reçues: {data}")
+        
+        # Récupérer l'utilisateur (optionnel pour mode gratuit)
+        token = request.headers.get('Authorization')
+        user = get_user_from_token(token) if token else None
+        
+        # Validation des données
+        port = data.get('port')
+        if not port or not isinstance(port, int) or port < 1 or port > 65535:
+            return jsonify({'error': 'Port invalide (1-65535 requis)'}), 400
+        
+        # Ports bloqués
+        blocked_ports = [22, 25, 53, 80, 443, 993, 995]
+        if port in blocked_ports:
+            return jsonify({'error': f'Port {port} bloqué pour des raisons de sécurité'}), 400
+        
+        # Sous-domaine
+        subdomain = data.get('subdomain')
+        if subdomain:
+            if not validate_subdomain(subdomain):
+                return jsonify({'error': 'Sous-domaine invalide (format incorrect)'}), 400
+            
+            # Vérifier si le sous-domaine est déjà utilisé
+            existing = Tunnel.query.filter_by(
+                subdomain=subdomain.lower(),
+                status='active'
+            ).filter(
+                Tunnel.expires_at > datetime.utcnow()
+            ).first()
+            
+            if existing:
+                return jsonify({'error': 'Sous-domaine déjà utilisé'}), 409
+                
+            subdomain = subdomain.lower()
+        else:
+            subdomain = generate_subdomain()
+        
+        # Durée
+        duration_str = data.get('duration', '2h')
+        try:
+            duration = parse_duration(duration_str)
+        except ValueError as e:
+            return jsonify({'error': f'Durée invalide: {duration_str}'}), 400
+        
+        # Limites pour utilisateurs non authentifiés
+        if not user:
+            # Limiter à 2h maximum pour les utilisateurs non authentifiés
+            if duration > timedelta(hours=2):
+                duration = timedelta(hours=2)
+        
+        # Construire l'URL publique
+        base_domain = os.getenv('RAILWAY_STATIC_URL', '').replace('https://', '').replace('http://', '')
+        if base_domain:
+            public_url = f"https://{base_domain}/{subdomain}"
+        else:
+            # Mode local
+            public_url = f"http://localhost:8080/{subdomain}"
+        
+        # Générer un ID de tunnel unique
+        tunnel_id = secrets.token_urlsafe(8)
+        expires_at = datetime.utcnow() + duration
+        
+        app.logger.info(f"Création tunnel: {tunnel_id}, subdomain: {subdomain}, port: {port}")
+        
         tunnel = tunnel_service.create_tunnel(
-            tunnel_id=secrets.token_urlsafe(8),
+            tunnel_id=tunnel_id,
             user_id=user.id if user else None,
             subdomain=subdomain,
             port=port,
             public_url=public_url,
-            expires_at=datetime.utcnow() + duration,
+            expires_at=expires_at,
             cors_enabled=data.get('cors', False),
             https_enabled=data.get('https', False),
             webhook_mode=data.get('webhook', False)
@@ -569,11 +627,27 @@ def create_tunnel():
             tunnel.set_password(data['password'])
             db.session.commit()
         
-        return jsonify(tunnel.to_dict()), 201
+        # Calculer expires_in pour la réponse
+        expires_in = int(duration.total_seconds())
+        
+        response_data = tunnel.to_dict()
+        response_data['expires_in'] = expires_in
+        
+        app.logger.info(f"Tunnel créé avec succès: {response_data}")
+        
+        return jsonify(response_data), 201
         
     except Exception as e:
+        app.logger.error(f"Erreur lors de la création du tunnel: {str(e)}", exc_info=True)
         db.session.rollback()
-        return jsonify({'error': f'Erreur lors de la création du tunnel: {str(e)}'}), 500
+        
+        # Retourner une erreur plus spécifique si possible
+        if "UNIQUE constraint failed" in str(e):
+            return jsonify({'error': 'Sous-domaine déjà utilisé'}), 409
+        elif "NOT NULL constraint failed" in str(e):
+            return jsonify({'error': 'Données manquantes requises'}), 400
+        else:
+            return jsonify({'error': f'Erreur interne: {str(e)}'}), 500
 
 
 @app.route('/api/tunnels', methods=['GET'])
@@ -1173,7 +1247,6 @@ def index():
     return render_template_string(html, **stats)
 
 
-# Dans votre route proxy_tunnel, remplacer par :
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
