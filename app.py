@@ -52,30 +52,18 @@ class Config:
     # Configuration base de données pour Railway
     if is_railway:
         # Sur Railway : utiliser DATABASE_URL fourni automatiquement
-        database_url = os.getenv('DATABASE_URL')
+        database_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_PRIVATE_URL')
         if database_url and database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
         SQLALCHEMY_DATABASE_URI = database_url
         print(f"🚄 Railway environment detected")
-        print(f"📊 Database: PostgreSQL")
+        print(f"📊 Database: PostgreSQL - {database_url[:50]}...")
     else:
         # En local : utiliser SQLite ou variable custom
         SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///flaskserver.db')
         print("🏠 Local environment detected")
         print(f"📊 Database: {SQLALCHEMY_DATABASE_URI.split('://')[0]}")
-    
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SQLALCHEMY_ENGINE_OPTIONS = {
-        'pool_timeout': 20,
-        'pool_recycle': 3600,  # 1 heure
-        'pool_pre_ping': True,
-        'pool_size': 5,
-        'max_overflow': 10
-    }
-    
-    PORT = int(os.getenv('PORT', 8080))
-    RAILWAY_ENVIRONMENT = os.getenv('RAILWAY_ENVIRONMENT_NAME', 'development')
 
 # Supprimer les warnings
 warnings.filterwarnings("ignore", message="Using the in-memory storage for tracking rate limits")
@@ -1175,11 +1163,11 @@ def index():
     return render_template_string(html, **stats)
 
 
-# 4. Modifier la route proxy pour gérer les sous-domaines comme des paths
+# Dans votre route proxy_tunnel, remplacer par :
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
-    """Proxy vers le tunnel correspondant."""
+    """Proxy via WebSocket vers le client local."""
     tunnel = Tunnel.query.filter_by(
         subdomain=subdomain,
         status='active'
@@ -1190,59 +1178,79 @@ def proxy_tunnel(subdomain: str, path: str = ''):
     if not tunnel:
         return jsonify({
             'error': 'Tunnel not found or expired',
-            'subdomain': subdomain,
-            'available_tunnels': [t.subdomain for t in Tunnel.query.filter_by(status='active').all()]
+            'subdomain': subdomain
         }), 404
     
-    # Vérifier le mot de passe si nécessaire
-    if tunnel.password_hash:
-        auth = request.authorization
-        if not auth or not tunnel.check_password(auth.password):
-            return jsonify({'error': 'Password required'}), 401
+    # Vérifier si le client est connecté via WebSocket
+    tunnel_room = f"tunnel_{tunnel.tunnel_id}"
+    connected_clients = socketio.manager.get_participants(tunnel_room)
     
-    # Construire l'URL de destination
-    target_url = f"http://127.0.0.1:{tunnel.port}/{path}"
-    if request.query_string:
-        target_url += f"?{request.query_string.decode()}"
+    if not connected_clients:
+        return jsonify({
+            'error': 'Tunnel client not connected',
+            'message': f'The tunnel client for {subdomain} is not connected. Please restart your FlaskTunnel client.',
+            'tunnel': tunnel.to_dict()
+        }), 502
     
-    try:
-        # Faire la requête proxy
-        response = requests.request(
-            method=request.method,
-            url=target_url,
-            headers={k: v for k, v in request.headers if k.lower() not in ['host', 'x-forwarded-for', 'x-forwarded-proto']},
-            data=request.get_data(),
-            params=request.args,
-            allow_redirects=False,
-            timeout=30
-        )
+    # Créer un ID unique pour cette requête
+    import uuid
+    request_id = str(uuid.uuid4())
+    
+    # Préparer les données de la requête
+    request_data = {
+        'request_id': request_id,
+        'method': request.method,
+        'path': f"/{path}",
+        'headers': dict(request.headers),
+        'params': dict(request.args),
+        'body': request.get_data().decode('utf-8', errors='ignore') if request.get_data() else None
+    }
+    
+    # Envoyer la requête via WebSocket et attendre la réponse
+    response_data = None
+    response_event = threading.Event()
+    
+    def handle_response(data):
+        nonlocal response_data
+        if data.get('request_id') == request_id:
+            response_data = data
+            response_event.set()
+    
+    # Écouter la réponse temporairement
+    @socketio.on('tunnel_response')
+    def on_tunnel_response(data):
+        handle_response(data)
+    
+    # Envoyer la requête
+    socketio.emit('tunnel_request', request_data, room=tunnel_room)
+    
+    # Attendre la réponse (timeout 30s)
+    if response_event.wait(timeout=30):
+        if 'error' in response_data:
+            return jsonify({
+                'error': 'Local service error',
+                'message': response_data['error'],
+                'tunnel': tunnel.to_dict()
+            }), response_data.get('status_code', 502)
         
-        # Mettre à jour les statistiques
+        # Construire la réponse HTTP
+        content = response_data['content']
+        if response_data.get('binary'):
+            import base64
+            content = base64.b64decode(content)
+        
+        # Mettre à jour les stats
         tunnel.requests_count += 1
         tunnel.last_activity = datetime.utcnow()
-        tunnel.bytes_transferred += len(response.content)
+        tunnel.bytes_transferred += len(content) if isinstance(content, bytes) else len(content.encode())
         db.session.commit()
         
-        # Notifier via WebSocket
-        try:
-            socketio.emit('tunnel_request', {
-                'tunnel_id': tunnel.tunnel_id,
-                'method': request.method,
-                'path': f"/{path}",
-                'ip': request.remote_addr,
-                'user_agent': request.headers.get('User-Agent', ''),
-                'status_code': response.status_code,
-                'timestamp': datetime.utcnow().isoformat()
-            }, room=f"tunnel_{tunnel.tunnel_id}")
-        except Exception:
-            pass  # Ignorer les erreurs WebSocket
-        
-        # Construire la réponse
+        # Headers (exclure certains headers)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        headers = [(name, value) for name, value in response.headers.items()
+        headers = [(name, value) for name, value in response_data['headers'].items()
                   if name.lower() not in excluded_headers]
         
-        # Ajouter CORS si activé
+        # CORS si activé
         if tunnel.cors_enabled:
             headers.extend([
                 ('Access-Control-Allow-Origin', '*'),
@@ -1250,21 +1258,14 @@ def proxy_tunnel(subdomain: str, path: str = ''):
                 ('Access-Control-Allow-Headers', 'Content-Type, Authorization')
             ])
         
-        return response.content, response.status_code, headers
-        
-    except requests.ConnectionError:
+        return content, response_data['status_code'], headers
+    
+    else:
         return jsonify({
-            'error': 'Connection refused',
-            'message': f'No service running on localhost:{tunnel.port}',
+            'error': 'Request timeout',
+            'message': 'The local service did not respond in time',
             'tunnel': tunnel.to_dict()
-        }), 502
-    except requests.Timeout:
-        return jsonify({'error': 'Request timeout'}), 504
-    except Exception as e:
-        return jsonify({
-            'error': 'Proxy error',
-            'message': str(e)
-        }), 500
+        }), 504
 
 
 # =============================================================================
@@ -1285,7 +1286,7 @@ def handle_disconnect():
 
 @socketio.on('join_tunnel')
 def handle_join_tunnel(data):
-    """Rejoindre une room de tunnel."""
+    """Le client rejoint la room de son tunnel."""
     tunnel_id = data.get('tunnel_id')
     if tunnel_id:
         join_room(f"tunnel_{tunnel_id}")
@@ -1374,16 +1375,18 @@ def init_db():
                         print(f"⏳ Retrying in {wait_time}s...")
                         time.sleep(wait_time)
                     else:
-                        # Fallback pour développement local uniquement
-                        if not app.config.get('is_railway', False):
+                        # Sur Railway, ne pas faire de fallback vers SQLite
+                        if app.config.get('is_railway', False):
+                            print("❌ Railway PostgreSQL connection failed - check DATABASE_URL")
+                            raise db_error
+                        else:
+                            # Fallback SQLite uniquement en local
                             print("🔄 Falling back to SQLite...")
                             app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///flaskserver.db'
                             db.create_all()
                             print("✅ SQLite fallback initialized!")
                             tunnel_service.mark_db_initialized()
                             return True
-                        else:
-                            raise db_error
                     
     except Exception as e:
         print(f"❌ Critical database error: {e}")
