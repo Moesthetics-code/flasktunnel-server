@@ -1247,10 +1247,16 @@ def index():
     return render_template_string(html, **stats)
 
 
+# Stockage global pour les réponses en attente
+pending_responses = {}
+response_events = {}
+
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
-    """Proxy via WebSocket vers le client local."""
+    """Proxy via WebSocket vers le client local - VERSION CORRIGÉE."""
+    
+    # Vérifier si le tunnel existe
     tunnel = Tunnel.query.filter_by(
         subdomain=subdomain,
         status='active'
@@ -1264,125 +1270,245 @@ def proxy_tunnel(subdomain: str, path: str = ''):
             'subdomain': subdomain
         }), 404
     
-    # Vérifier si le client est connecté via WebSocket
+    # Vérifier si le client est connecté
     tunnel_room = f"tunnel_{tunnel.tunnel_id}"
-    connected_clients = socketio.manager.get_participants(tunnel_room)
     
-    if not connected_clients:
+    try:
+        # Vérifier les clients connectés dans la room
+        connected_clients = socketio.server.manager.get_participants(
+            namespace='/', room=tunnel_room
+        )
+        
+        if not connected_clients:
+            return jsonify({
+                'error': 'Tunnel client not connected',
+                'message': f'The tunnel client for {subdomain} is not connected. Please restart your FlaskTunnel client.',
+                'tunnel': tunnel.to_dict()
+            }), 502
+        
+    except Exception as e:
+        print(f"Erreur lors de la vérification des clients connectés: {e}")
         return jsonify({
-            'error': 'Tunnel client not connected',
-            'message': f'The tunnel client for {subdomain} is not connected. Please restart your FlaskTunnel client.',
-            'tunnel': tunnel.to_dict()
-        }), 502
+            'error': 'Internal server error',
+            'message': 'Unable to check tunnel connection status'
+        }), 500
     
     # Créer un ID unique pour cette requête
-    import uuid
     request_id = str(uuid.uuid4())
     
     # Préparer les données de la requête
     request_data = {
         'request_id': request_id,
         'method': request.method,
-        'path': f"/{path}",
+        'path': f"/{path}" if path else "/",
         'headers': dict(request.headers),
         'params': dict(request.args),
-        'body': request.get_data().decode('utf-8', errors='ignore') if request.get_data() else None
+        'body': request.get_data().decode('utf-8', errors='ignore') if request.get_data() else None,
+        'ip': request.remote_addr
     }
     
-    # Envoyer la requête via WebSocket et attendre la réponse
-    response_data = None
+    # Préparer le système d'attente de réponse
     response_event = threading.Event()
+    pending_responses[request_id] = None
+    response_events[request_id] = response_event
     
-    def handle_response(data):
-        nonlocal response_data
-        if data.get('request_id') == request_id:
-            response_data = data
-            response_event.set()
-    
-    # Écouter la réponse temporairement
-    @socketio.on('tunnel_response')
-    def on_tunnel_response(data):
-        handle_response(data)
-    
-    # Envoyer la requête
-    socketio.emit('tunnel_request', request_data, room=tunnel_room)
-    
-    # Attendre la réponse (timeout 30s)
-    if response_event.wait(timeout=30):
-        if 'error' in response_data:
+    try:
+        # Envoyer la requête via WebSocket
+        socketio.emit('tunnel_request', request_data, room=tunnel_room)
+        print(f"Requête envoyée pour tunnel {tunnel.tunnel_id}: {request.method} {path}")
+        
+        # Attendre la réponse avec timeout
+        if response_event.wait(timeout=30):
+            response_data = pending_responses.get(request_id)
+            
+            if response_data is None:
+                return jsonify({
+                    'error': 'No response received',
+                    'message': 'The tunnel client did not provide a response'
+                }), 502
+            
+            # Vérifier s'il y a une erreur dans la réponse
+            if 'error' in response_data:
+                return jsonify({
+                    'error': 'Local service error',
+                    'message': response_data['error'],
+                    'tunnel': tunnel.to_dict()
+                }), response_data.get('status_code', 502)
+            
+            # Construire la réponse HTTP
+            content = response_data.get('content', '')
+            
+            # Gérer le contenu binaire
+            if response_data.get('binary', False):
+                try:
+                    import base64
+                    content = base64.b64decode(content)
+                except Exception as e:
+                    print(f"Erreur décodage base64: {e}")
+                    content = content.encode('utf-8')
+            
+            # Mettre à jour les statistiques du tunnel
+            try:
+                tunnel.requests_count += 1
+                tunnel.last_activity = datetime.utcnow()
+                
+                # Calculer la taille du contenu transféré
+                if isinstance(content, bytes):
+                    tunnel.bytes_transferred += len(content)
+                else:
+                    tunnel.bytes_transferred += len(str(content).encode('utf-8'))
+                
+                db.session.commit()
+            except Exception as e:
+                print(f"Erreur mise à jour stats: {e}")
+            
+            # Préparer les headers de réponse
+            response_headers = response_data.get('headers', {})
+            
+            # Exclure certains headers problématiques
+            excluded_headers = {
+                'content-encoding', 'content-length', 'transfer-encoding', 
+                'connection', 'upgrade', 'host'
+            }
+            
+            headers = [
+                (name, value) for name, value in response_headers.items()
+                if name.lower() not in excluded_headers
+            ]
+            
+            # Ajouter CORS si activé
+            if tunnel.cors_enabled:
+                headers.extend([
+                    ('Access-Control-Allow-Origin', '*'),
+                    ('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH'),
+                    ('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+                ])
+            
+            # Retourner la réponse
+            status_code = response_data.get('status_code', 200)
+            return content, status_code, headers
+        
+        else:
+            # Timeout
             return jsonify({
-                'error': 'Local service error',
-                'message': response_data['error'],
+                'error': 'Request timeout',
+                'message': 'The local service did not respond within 30 seconds',
                 'tunnel': tunnel.to_dict()
-            }), response_data.get('status_code', 502)
-        
-        # Construire la réponse HTTP
-        content = response_data['content']
-        if response_data.get('binary'):
-            import base64
-            content = base64.b64decode(content)
-        
-        # Mettre à jour les stats
-        tunnel.requests_count += 1
-        tunnel.last_activity = datetime.utcnow()
-        tunnel.bytes_transferred += len(content) if isinstance(content, bytes) else len(content.encode())
-        db.session.commit()
-        
-        # Headers (exclure certains headers)
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        headers = [(name, value) for name, value in response_data['headers'].items()
-                  if name.lower() not in excluded_headers]
-        
-        # CORS si activé
-        if tunnel.cors_enabled:
-            headers.extend([
-                ('Access-Control-Allow-Origin', '*'),
-                ('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS'),
-                ('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-            ])
-        
-        return content, response_data['status_code'], headers
+            }), 504
     
-    else:
+    except Exception as e:
+        print(f"Erreur dans proxy_tunnel: {e}")
         return jsonify({
-            'error': 'Request timeout',
-            'message': 'The local service did not respond in time',
-            'tunnel': tunnel.to_dict()
-        }), 504
+            'error': 'Internal server error',
+            'message': 'An unexpected error occurred while processing the request'
+        }), 500
+    
+    finally:
+        # Nettoyer les données de la requête
+        pending_responses.pop(request_id, None)
+        response_events.pop(request_id, None)
 
 
 # =============================================================================
-# WebSocket Events
+# GESTIONNAIRE D'ÉVÉNEMENTS WEBSOCKET CORRIGÉS
 # =============================================================================
 
 @socketio.on('connect')
 def handle_connect():
     """Client connecté."""
-    print(f"Client connecté: {request.sid}")
+    print(f"✅ Client connecté: {request.sid}")
+    emit('connection_confirmed', {'status': 'connected', 'sid': request.sid})
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
     """Client déconnecté."""
-    print(f"Client déconnecté: {request.sid}")
+    print(f"❌ Client déconnecté: {request.sid}")
 
 
 @socketio.on('join_tunnel')
 def handle_join_tunnel(data):
     """Le client rejoint la room de son tunnel."""
-    tunnel_id = data.get('tunnel_id')
-    if tunnel_id:
-        join_room(f"tunnel_{tunnel_id}")
-        emit('tunnel_joined', {'tunnel_id': tunnel_id})
+    try:
+        tunnel_id = data.get('tunnel_id')
+        if not tunnel_id:
+            emit('error', {'message': 'tunnel_id requis'})
+            return
+        
+        room_name = f"tunnel_{tunnel_id}"
+        join_room(room_name)
+        
+        print(f"✅ Client {request.sid} a rejoint le tunnel {tunnel_id}")
+        emit('tunnel_joined', {
+            'tunnel_id': tunnel_id,
+            'room': room_name,
+            'status': 'joined'
+        })
+        
+    except Exception as e:
+        print(f"Erreur join_tunnel: {e}")
+        emit('error', {'message': f'Erreur lors de la connexion au tunnel: {str(e)}'})
 
 
 @socketio.on('leave_tunnel')
 def handle_leave_tunnel(data):
     """Quitter une room de tunnel."""
-    tunnel_id = data.get('tunnel_id')
-    if tunnel_id:
-        leave_room(f"tunnel_{tunnel_id}")
-        emit('tunnel_left', {'tunnel_id': tunnel_id})
+    try:
+        tunnel_id = data.get('tunnel_id')
+        if tunnel_id:
+            room_name = f"tunnel_{tunnel_id}"
+            leave_room(room_name)
+            
+            print(f"✅ Client {request.sid} a quitté le tunnel {tunnel_id}")
+            emit('tunnel_left', {
+                'tunnel_id': tunnel_id,
+                'room': room_name,
+                'status': 'left'
+            })
+            
+    except Exception as e:
+        print(f"Erreur leave_tunnel: {e}")
+        emit('error', {'message': f'Erreur lors de la déconnexion du tunnel: {str(e)}'})
+
+
+@socketio.on('tunnel_response')
+def handle_tunnel_response(data):
+    """Recevoir une réponse du client tunnel."""
+    try:
+        request_id = data.get('request_id')
+        if not request_id:
+            print("❌ Réponse tunnel sans request_id")
+            return
+        
+        print(f"✅ Réponse reçue pour request_id: {request_id}")
+        
+        # Stocker la réponse
+        pending_responses[request_id] = data
+        
+        # Signaler que la réponse est disponible
+        if request_id in response_events:
+            response_events[request_id].set()
+        else:
+            print(f"⚠️  Pas d'event en attente pour request_id: {request_id}")
+    
+    except Exception as e:
+        print(f"❌ Erreur handle_tunnel_response: {e}")
+
+
+@socketio.on('tunnel_status')
+def handle_tunnel_status(data):
+    """Recevoir le statut d'un tunnel."""
+    try:
+        tunnel_id = data.get('tunnel_id')
+        status = data.get('status')
+        
+        print(f"📊 Statut tunnel {tunnel_id}: {status}")
+        
+        # Émettre le statut à tous les clients dans la room admin
+        emit('tunnel_status_update', data, room='admin')
+        
+    except Exception as e:
+        print(f"Erreur handle_tunnel_status: {e}")
 
 
 # =============================================================================
@@ -1404,6 +1530,36 @@ def internal_error(error):
 def ratelimit_handler(e):
     return jsonify({'error': 'Rate limit exceeded', 'message': str(e.description)}), 429
 
+
+@app.route('/api/debug/tunnels/<tunnel_id>')
+def debug_tunnel(tunnel_id):
+    """Debug d'un tunnel spécifique."""
+    try:
+        tunnel = Tunnel.query.filter_by(tunnel_id=tunnel_id).first()
+        if not tunnel:
+            return jsonify({'error': 'Tunnel not found'}), 404
+        
+        room_name = f"tunnel_{tunnel_id}"
+        
+        # Vérifier les clients connectés
+        try:
+            connected_clients = socketio.server.manager.get_participants(
+                namespace='/', room=room_name
+            )
+        except:
+            connected_clients = []
+        
+        return jsonify({
+            'tunnel': tunnel.to_dict(),
+            'room_name': room_name,
+            'connected_clients': len(connected_clients),
+            'clients': list(connected_clients) if connected_clients else [],
+            'pending_responses': len(pending_responses),
+            'response_events': len(response_events)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # =============================================================================
 # Cleanup on shutdown
