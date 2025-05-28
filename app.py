@@ -1318,7 +1318,7 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         print(f"Requête envoyée pour tunnel {tunnel.tunnel_id}: {request.method} {path}")
         
         # Attendre la réponse avec timeout
-        if response_event.wait(timeout=3000):
+        if response_event.wait(timeout=30):
             response_data = pending_responses.get(request_id)
             
             if response_data is None:
