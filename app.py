@@ -1254,7 +1254,7 @@ response_events = {}
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
-    """Proxy via WebSocket vers le client local - VERSION CORRIGÉE."""
+    """Proxy via WebSocket vers le client local - VERSION CORRIGÉE avec préservation subdomain."""
     
     # Vérifier si le tunnel existe
     tunnel = Tunnel.query.filter_by(
@@ -1304,7 +1304,8 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         'headers': dict(request.headers),
         'params': dict(request.args),
         'body': request.get_data().decode('utf-8', errors='ignore') if request.get_data() else None,
-        'ip': request.remote_addr
+        'ip': request.remote_addr,
+        'subdomain': subdomain  # Ajouter le subdomain pour le client
     }
     
     # Préparer le système d'attente de réponse
@@ -1346,6 +1347,10 @@ def proxy_tunnel(subdomain: str, path: str = ''):
                 except Exception as e:
                     print(f"Erreur décodage base64: {e}")
                     content = content.encode('utf-8')
+            else:
+                # CORRECTION PRINCIPALE: Modifier le contenu HTML pour préserver le subdomain
+                if isinstance(content, str) and 'text/html' in response_data.get('headers', {}).get('content-type', ''):
+                    content = fix_html_links(content, subdomain, request.host)
             
             # Mettre à jour les statistiques du tunnel
             try:
@@ -1364,6 +1369,11 @@ def proxy_tunnel(subdomain: str, path: str = ''):
             
             # Préparer les headers de réponse
             response_headers = response_data.get('headers', {})
+            
+            # CORRECTION: Modifier les headers Location pour les redirections
+            if 'location' in response_headers:
+                location = response_headers['location']
+                response_headers['location'] = fix_redirect_location(location, subdomain, request.host)
             
             # Exclure certains headers problématiques
             excluded_headers = {
@@ -1407,6 +1417,69 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         # Nettoyer les données de la requête
         pending_responses.pop(request_id, None)
         response_events.pop(request_id, None)
+
+
+def fix_html_links(html_content: str, subdomain: str, host: str) -> str:
+    """Corriger les liens dans le contenu HTML pour préserver le subdomain."""
+    import re
+    
+    # Corriger les liens relatifs qui commencent par /
+    def replace_absolute_links(match):
+        link = match.group(1)
+        if link.startswith('/'):
+            # Ne pas modifier si c'est déjà préfixé avec le subdomain
+            if not link.startswith(f'/{subdomain}/'):
+                return f'href="/{subdomain}{link}"'
+        return match.group(0)
+    
+    def replace_action_links(match):
+        action = match.group(1)
+        if action.startswith('/'):
+            # Ne pas modifier si c'est déjà préfixé avec le subdomain
+            if not action.startswith(f'/{subdomain}/'):
+                return f'action="/{subdomain}{action}"'
+        return match.group(0)
+    
+    def replace_src_links(match):
+        src = match.group(1)
+        if src.startswith('/'):
+            # Ne pas modifier si c'est déjà préfixé avec le subdomain
+            if not src.startswith(f'/{subdomain}/'):
+                return f'src="/{subdomain}{src}"'
+        return match.group(0)
+    
+    # Appliquer les corrections
+    html_content = re.sub(r'href="([^"]*)"', replace_absolute_links, html_content, flags=re.IGNORECASE)
+    html_content = re.sub(r'action="([^"]*)"', replace_action_links, html_content, flags=re.IGNORECASE)
+    html_content = re.sub(r'src="([^"]*)"', replace_src_links, html_content, flags=re.IGNORECASE)
+    
+    # Corriger également les liens dans le JavaScript (plus complexe, optionnel)
+    # Vous pouvez étendre cette fonction selon vos besoins
+    
+    return html_content
+
+
+def fix_redirect_location(location: str, subdomain: str, host: str) -> str:
+    """Corriger l'URL de redirection pour préserver le subdomain."""
+    
+    # Si c'est une URL relative qui commence par /
+    if location.startswith('/'):
+        # Ne pas modifier si c'est déjà préfixé avec le subdomain
+        if not location.startswith(f'/{subdomain}/'):
+            return f'/{subdomain}{location}'
+    
+    # Si c'est une URL absolue qui pointe vers localhost
+    elif 'localhost' in location or '127.0.0.1' in location:
+        # Remplacer par l'URL du tunnel
+        import re
+        # Extraire le chemin de l'URL locale
+        path_match = re.search(r'://[^/]+(.*)$', location)
+        if path_match:
+            path = path_match.group(1)
+            if not path.startswith(f'/{subdomain}/'):
+                return f'https://{host}/{subdomain}{path}'
+    
+    return location
 
 
 # =============================================================================
