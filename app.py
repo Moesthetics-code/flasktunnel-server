@@ -1296,7 +1296,7 @@ response_events = {}
 @app.route('/<subdomain>')
 @app.route('/<subdomain>/<path:path>')
 def proxy_tunnel(subdomain: str, path: str = ''):
-    """Proxy via WebSocket vers le client local - VERSION CORRIGÉE."""
+    """Proxy via WebSocket vers le client local - VERSION CORRIGÉE AVEC PRÉFIXE."""
     
     # Vérifier si le tunnel existe
     tunnel = Tunnel.query.filter_by(
@@ -1309,15 +1309,13 @@ def proxy_tunnel(subdomain: str, path: str = ''):
     if not tunnel:
         return jsonify({
             'error': 'Tunnel not found or expired',
-            'subdomain': subdomain,
-            'message': f'Le tunnel "{subdomain}" est introuvable ou a expiré.'
+            'subdomain': subdomain
         }), 404
     
     # Vérifier si le client est connecté
     tunnel_room = f"tunnel_{tunnel.tunnel_id}"
     
     try:
-        # Vérifier les clients connectés dans la room
         connected_clients = socketio.server.manager.get_participants(
             namespace='/', room=tunnel_room
         )
@@ -1325,7 +1323,7 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         if not connected_clients:
             return jsonify({
                 'error': 'Tunnel client not connected',
-                'message': f'Le client tunnel pour "{subdomain}" n\'est pas connecté. Veuillez redémarrer votre client FlaskTunnel.',
+                'message': f'The tunnel client for {subdomain} is not connected. Please restart your FlaskTunnel client.',
                 'tunnel': tunnel.to_dict()
             }), 502
         
@@ -1333,54 +1331,62 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         print(f"Erreur lors de la vérification des clients connectés: {e}")
         return jsonify({
             'error': 'Internal server error',
-            'message': 'Impossible de vérifier le statut de connexion du tunnel'
+            'message': 'Unable to check tunnel connection status'
         }), 500
     
     # Créer un ID unique pour cette requête
     request_id = str(uuid.uuid4())
     
-    # Construire le chemin complet avec le sous-domaine
-    full_path = f"/{path}" if path else "/"
+    # CORRECTION: Préserver le chemin original avec le sous-domaine
+    original_path = f"/{path}" if path else "/"
     
-    # CORRECTION PRINCIPALE: Préserver le sous-domaine dans les headers
-    # pour que l'application locale puisse générer les bons liens
-    original_host = request.headers.get('Host', '')
+    # Préparer les headers modifiés pour inclure le préfixe du tunnel
+    modified_headers = dict(request.headers)
+    
+    # Ajouter des headers spéciaux pour indiquer le contexte du tunnel
+    modified_headers['X-FlaskTunnel-Subdomain'] = subdomain
+    modified_headers['X-FlaskTunnel-Original-Host'] = request.headers.get('Host', '')
+    modified_headers['X-FlaskTunnel-Public-URL'] = tunnel.public_url
+    modified_headers['X-Original-URI'] = f"/{subdomain}{original_path}"
+    
+    # Modifier l'URL de base pour les redirections
+    scheme = 'https' if tunnel.https_enabled else 'http'
+    base_domain = os.getenv('RAILWAY_STATIC_URL', 'localhost:8080').replace('https://', '').replace('http://', '')
+    modified_headers['X-Forwarded-Host'] = f"{base_domain}"
+    modified_headers['X-Forwarded-Proto'] = scheme
+    modified_headers['X-Script-Name'] = f"/{subdomain}"
     
     # Préparer les données de la requête
     request_data = {
         'request_id': request_id,
         'method': request.method,
-        'path': full_path,
-        'headers': dict(request.headers),
+        'path': original_path,
+        'headers': modified_headers,
         'params': dict(request.args),
         'body': request.get_data().decode('utf-8', errors='ignore') if request.get_data() else None,
         'ip': request.remote_addr,
-        'subdomain': subdomain,  # Ajouter le sous-domaine
-        'original_url': request.url,  # URL complète originale
-        'base_url': request.base_url  # URL de base
+        'subdomain': subdomain,  # NOUVEAU: Inclure le sous-domaine
+        'public_url': tunnel.public_url  # NOUVEAU: URL publique complète
     }
     
-    # Préparer le système d'attente de réponse
+    # Reste du code proxy inchangé...
     response_event = threading.Event()
     pending_responses[request_id] = None
     response_events[request_id] = response_event
     
     try:
-        # Envoyer la requête via WebSocket
         socketio.emit('tunnel_request', request_data, room=tunnel_room)
-        print(f"Requête envoyée pour tunnel {tunnel.tunnel_id}: {request.method} /{subdomain}{full_path}")
+        print(f"Requête envoyée pour tunnel {tunnel.tunnel_id}: {request.method} /{subdomain}{original_path}")
         
-        # Attendre la réponse avec timeout
         if response_event.wait(timeout=30):
             response_data = pending_responses.get(request_id)
             
             if response_data is None:
                 return jsonify({
                     'error': 'No response received',
-                    'message': 'Le client tunnel n\'a pas fourni de réponse'
+                    'message': 'The tunnel client did not provide a response'
                 }), 502
             
-            # Vérifier s'il y a une erreur dans la réponse
             if 'error' in response_data:
                 return jsonify({
                     'error': 'Local service error',
@@ -1388,37 +1394,26 @@ def proxy_tunnel(subdomain: str, path: str = ''):
                     'tunnel': tunnel.to_dict()
                 }), response_data.get('status_code', 502)
             
-            # Construire la réponse HTTP
             content = response_data.get('content', '')
             
             # Gérer le contenu binaire
             if response_data.get('binary', False):
                 try:
+                    import base64
                     content = base64.b64decode(content)
                 except Exception as e:
                     print(f"Erreur décodage base64: {e}")
                     content = content.encode('utf-8')
             
-            # CORRECTION CRITIQUE: Réécrire les URLs dans le contenu HTML
-            # pour préserver le sous-domaine
-            if isinstance(content, str) and 'text/html' in response_data.get('headers', {}).get('content-type', ''):
-                content = rewrite_html_urls(content, subdomain, original_host)
-            elif isinstance(content, bytes):
-                try:
-                    content_str = content.decode('utf-8')
-                    if 'text/html' in response_data.get('headers', {}).get('content-type', ''):
-                        content_str = rewrite_html_urls(content_str, subdomain, original_host)
-                        content = content_str.encode('utf-8')
-                except UnicodeDecodeError:
-                    # Garder le contenu binaire tel quel
-                    pass
+            # NOUVELLE FONCTIONNALITÉ: Corriger les redirections dans le contenu HTML
+            if isinstance(content, str) and response_data.get('headers', {}).get('content-type', '').startswith('text/html'):
+                content = fix_html_links(content, subdomain, tunnel.public_url)
             
-            # Mettre à jour les statistiques du tunnel
+            # Mettre à jour les statistiques
             try:
                 tunnel.requests_count += 1
                 tunnel.last_activity = datetime.utcnow()
                 
-                # Calculer la taille du contenu transféré
                 if isinstance(content, bytes):
                     tunnel.bytes_transferred += len(content)
                 else:
@@ -1431,7 +1426,18 @@ def proxy_tunnel(subdomain: str, path: str = ''):
             # Préparer les headers de réponse
             response_headers = response_data.get('headers', {})
             
-            # Exclure certains headers problématiques
+            # CORRECTION: Modifier les headers de redirection
+            if 'location' in response_headers:
+                location = response_headers['location']
+                # Si c'est une redirection relative, ajouter le préfixe du sous-domaine
+                if location.startswith('/') and not location.startswith(f'/{subdomain}'):
+                    response_headers['location'] = f"/{subdomain}{location}"
+                # Si c'est une redirection vers l'hôte local, remplacer par l'URL publique
+                elif location.startswith('http://localhost') or location.startswith('http://127.0.0.1'):
+                    import re
+                    location = re.sub(r'http://(?:localhost|127\.0\.0\.1):\d+', tunnel.public_url, location)
+                    response_headers['location'] = location
+            
             excluded_headers = {
                 'content-encoding', 'content-length', 'transfer-encoding', 
                 'connection', 'upgrade', 'host'
@@ -1442,7 +1448,6 @@ def proxy_tunnel(subdomain: str, path: str = ''):
                 if name.lower() not in excluded_headers
             ]
             
-            # Ajouter CORS si activé
             if tunnel.cors_enabled:
                 headers.extend([
                     ('Access-Control-Allow-Origin', '*'),
@@ -1450,18 +1455,13 @@ def proxy_tunnel(subdomain: str, path: str = ''):
                     ('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
                 ])
             
-            # CORRECTION: Ajouter un header personnalisé pour indiquer le sous-domaine
-            headers.append(('X-FlaskTunnel-Subdomain', subdomain))
-            
-            # Retourner la réponse
             status_code = response_data.get('status_code', 200)
             return content, status_code, headers
         
         else:
-            # Timeout
             return jsonify({
                 'error': 'Request timeout',
-                'message': 'Le service local n\'a pas répondu dans les 30 secondes',
+                'message': 'The local service did not respond within 30 seconds',
                 'tunnel': tunnel.to_dict()
             }), 504
     
@@ -1469,125 +1469,97 @@ def proxy_tunnel(subdomain: str, path: str = ''):
         print(f"Erreur dans proxy_tunnel: {e}")
         return jsonify({
             'error': 'Internal server error',
-            'message': 'Une erreur inattendue s\'est produite lors du traitement de la requête'
+            'message': 'An unexpected error occurred while processing the request'
         }), 500
     
     finally:
-        # Nettoyer les données de la requête
         pending_responses.pop(request_id, None)
         response_events.pop(request_id, None)
 
 
-def rewrite_html_urls(html_content: str, subdomain: str, original_host: str) -> str:
-    """
-    Réécrire les URLs dans le contenu HTML pour préserver le sous-domaine.
-    """
+# =============================================================================
+# 2. FONCTION UTILITAIRE POUR CORRIGER LES LIENS HTML
+# =============================================================================
+
+def fix_html_links(html_content: str, subdomain: str, public_url: str) -> str:
+    """Corriger les liens dans le contenu HTML pour inclure le préfixe du sous-domaine."""
     import re
     
-    # Patterns pour matcher les URLs relatives
-    patterns = [
-        # href="/path" -> href="/subdomain/path"
-        (r'href="(/[^"]*)"', f'href="/{subdomain}\\1"'),
-        # src="/path" -> src="/subdomain/path"  
-        (r'src="(/[^"]*)"', f'src="/{subdomain}\\1"'),
-        # action="/path" -> action="/subdomain/path"
-        (r'action="(/[^"]*)"', f'action="/{subdomain}\\1"'),
-        # url(/path) -> url(/subdomain/path) pour CSS
-        (r'url\((/[^)]*)\)', f'url(/{subdomain}\\1)'),
-        # fetch('/path') -> fetch('/subdomain/path') pour JavaScript
-        (r"fetch\(['\"](/[^'\"]*)['\"]", f"fetch('/{subdomain}\\1'"),
-        # $.get('/path') -> $.get('/subdomain/path') pour jQuery
-        (r"\$\.get\(['\"](/[^'\"]*)['\"]", f"$.get('/{subdomain}\\1'"),
-        # $.post('/path') -> $.post('/subdomain/path') pour jQuery
-        (r"\$\.post\(['\"](/[^'\"]*)['\"]", f"$.post('/{subdomain}\\1'"),
-        # XMLHttpRequest.open('GET', '/path') -> XMLHttpRequest.open('GET', '/subdomain/path')
-        (r"\.open\(['\"][^'\"]*['\"],\s*['\"](/[^'\"]*)['\"]", f".open('\\1', '/{subdomain}\\2'"),
-    ]
-    
-    modified_content = html_content
-    
-    for pattern, replacement in patterns:
-        # Éviter de doubler le sous-domaine s'il est déjà présent
-        safe_replacement = replacement.replace(f'/{subdomain}/', f'/{subdomain}/')
-        safe_replacement = safe_replacement.replace(f'/{subdomain}/{subdomain}/', f'/{subdomain}/')
+    try:
+        # Corriger les attributs href et src qui commencent par /
+        def fix_absolute_paths(match):
+            tag = match.group(1)
+            attr = match.group(2)
+            quote = match.group(3)
+            path = match.group(4)
+            
+            # Ne pas modifier si le chemin contient déjà le sous-domaine
+            if path.startswith(f'/{subdomain}/') or path.startswith(f'/{subdomain}?'):
+                return match.group(0)
+            
+            # Ajouter le préfixe du sous-domaine
+            if path.startswith('/'):
+                new_path = f"/{subdomain}{path}"
+            else:
+                new_path = f"/{subdomain}/{path}"
+            
+            return f'<{tag} {attr}={quote}{new_path}{quote}'
         
-        modified_content = re.sub(pattern, safe_replacement, modified_content)
-    
-    # Ajouter un script JavaScript pour intercepter les navigations
-    inject_script = f"""
-    <script>
-    (function() {{
-        // Intercepter les soumissions de formulaires
-        document.addEventListener('submit', function(e) {{
-            var form = e.target;
-            var action = form.getAttribute('action');
-            if (action && action.startsWith('/') && !action.startsWith('/{subdomain}/')) {{
-                form.setAttribute('action', '/{subdomain}' + action);
-            }}
-        }});
+        # Pattern pour href et src
+        pattern = r'<(\w+)[^>]*\s(href|src)=(["\'])(/[^"\']*)\3'
+        html_content = re.sub(pattern, fix_absolute_paths, html_content)
         
-        // Intercepter les clics sur les liens
-        document.addEventListener('click', function(e) {{
-            var link = e.target.closest('a');
-            if (link && link.href) {{
-                var url = new URL(link.href);
-                if (url.pathname.startsWith('/') && !url.pathname.startsWith('/{subdomain}/')) {{
-                    url.pathname = '/{subdomain}' + url.pathname;
-                    link.href = url.toString();
-                }}
-            }}
-        }});
+        # Corriger les formulaires
+        def fix_form_action(match):
+            form_start = match.group(1)
+            quote = match.group(2)
+            action = match.group(3)
+            
+            if action.startswith('/') and not action.startswith(f'/{subdomain}'):
+                new_action = f"/{subdomain}{action}"
+                return f'{form_start}action={quote}{new_action}{quote}'
+            
+            return match.group(0)
         
-        // Intercepter fetch()
-        if (window.fetch) {{
-            var originalFetch = window.fetch;
-            window.fetch = function(url, options) {{
-                if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('/{subdomain}/')) {{
-                    url = '/{subdomain}' + url;
-                }}
-                return originalFetch.call(this, url, options);
-            }};
-        }}
+        form_pattern = r'(<form[^>]*\s)action=(["\'])(/[^"\']*)\2'
+        html_content = re.sub(form_pattern, fix_form_action, html_content)
         
-        // Intercepter XMLHttpRequest
-        if (window.XMLHttpRequest) {{
-            var originalOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url, ...args) {{
-                if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('/{subdomain}/')) {{
-                    url = '/{subdomain}' + url;
-                }}
-                return originalOpen.call(this, method, url, ...args);
-            }};
-        }}
-    }})();
-    </script>
-    """
-    
-    # Injecter le script avant la fermeture du body
-    if '</body>' in modified_content:
-        modified_content = modified_content.replace('</body>', inject_script + '</body>')
-    elif '</html>' in modified_content:
-        modified_content = modified_content.replace('</html>', inject_script + '</html>')
-    else:
-        modified_content += inject_script
-    
-    return modified_content
+        # Corriger les redirections JavaScript
+        js_patterns = [
+            (r'window\.location\s*=\s*["\'](/[^"\']+)["\']', r'window.location = "/{}/\1"'.format(subdomain)),
+            (r'location\.href\s*=\s*["\'](/[^"\']+)["\']', r'location.href = "/{}/\1"'.format(subdomain)),
+            (r'document\.location\s*=\s*["\'](/[^"\']+)["\']', r'document.location = "/{}/\1"'.format(subdomain))
+        ]
+        
+        for pattern, replacement in js_patterns:
+            html_content = re.sub(pattern, replacement, html_content)
+        
+        return html_content
+        
+    except Exception as e:
+        print(f"Erreur lors de la correction des liens HTML: {e}")
+        return html_content
 
 
 # =============================================================================
-# GESTIONNAIRES D'ÉVÉNEMENTS WEBSOCKET CÔTÉ SERVEUR
+# Gestionnaires Socket.IO - Version formatée
 # =============================================================================
 
 @socketio.on('connect')
 def handle_connect():
     """Client connecté."""
     print(f"✅ Client connecté: {request.sid}")
-    emit('connection_confirmed', {'status': 'connected', 'sid': request.sid})
+    emit('connection_confirmed', {
+        'status': 'connected', 
+        'sid': request.sid
+    })
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     """Client déconnecté."""
     print(f"❌ Client déconnecté: {request.sid}")
+
 
 @socketio.on('join_tunnel')
 def handle_join_tunnel(data):
@@ -1597,11 +1569,12 @@ def handle_join_tunnel(data):
         if not tunnel_id:
             emit('error', {'message': 'tunnel_id requis'})
             return
-            
+        
         room_name = f"tunnel_{tunnel_id}"
         join_room(room_name)
         
         print(f"✅ Client {request.sid} a rejoint le tunnel {tunnel_id}")
+        
         emit('tunnel_joined', {
             'tunnel_id': tunnel_id,
             'room': room_name,
@@ -1610,7 +1583,10 @@ def handle_join_tunnel(data):
         
     except Exception as e:
         print(f"Erreur join_tunnel: {e}")
-        emit('error', {'message': f'Erreur lors de la connexion au tunnel: {str(e)}'})
+        emit('error', {
+            'message': f'Erreur lors de la connexion au tunnel: {str(e)}'
+        })
+
 
 @socketio.on('leave_tunnel')
 def handle_leave_tunnel(data):
@@ -1622,6 +1598,7 @@ def handle_leave_tunnel(data):
             leave_room(room_name)
             
             print(f"✅ Client {request.sid} a quitté le tunnel {tunnel_id}")
+            
             emit('tunnel_left', {
                 'tunnel_id': tunnel_id,
                 'room': room_name,
@@ -1630,7 +1607,10 @@ def handle_leave_tunnel(data):
             
     except Exception as e:
         print(f"Erreur leave_tunnel: {e}")
-        emit('error', {'message': f'Erreur lors de la déconnexion du tunnel: {str(e)}'})
+        emit('error', {
+            'message': f'Erreur lors de la déconnexion du tunnel: {str(e)}'
+        })
+
 
 @socketio.on('tunnel_response')
 def handle_tunnel_response(data):
@@ -1640,7 +1620,7 @@ def handle_tunnel_response(data):
         if not request_id:
             print("❌ Réponse tunnel sans request_id")
             return
-            
+        
         print(f"✅ Réponse reçue pour request_id: {request_id}")
         
         # Stocker la réponse
@@ -1650,10 +1630,11 @@ def handle_tunnel_response(data):
         if request_id in response_events:
             response_events[request_id].set()
         else:
-            print(f"⚠️  Pas d'event en attente pour request_id: {request_id}")
+            print(f"⚠️ Pas d'event en attente pour request_id: {request_id}")
             
     except Exception as e:
         print(f"❌ Erreur handle_tunnel_response: {e}")
+
 
 @socketio.on('tunnel_status')
 def handle_tunnel_status(data):
@@ -1669,7 +1650,6 @@ def handle_tunnel_status(data):
         
     except Exception as e:
         print(f"Erreur handle_tunnel_status: {e}")
-
 
 # =============================================================================
 # Error Handlers
